@@ -1,16 +1,18 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
 using KKAPI.Studio.UI.Toolbars;
+using KKAPI.Utilities;
 using Studio;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.Remoting.Messaging;
 using UnityEngine;
 
 namespace KK_StudioVoice
 {
-    [BepInPlugin("com.example.voiceplayer", "KK Studio Voice Player", "1.1.0")]
+    [BepInPlugin("KK_StudioVoice", "KK_StudioVoice", "1.1.0")]
     [BepInProcess("CharaStudio")]
     public class MyVoicePlugin : BaseUnityPlugin
     {
@@ -19,8 +21,20 @@ namespace KK_StudioVoice
         private Texture2D _toolbarIcon; // 1つのテクスチャを使い回す
         private byte[] _originalIconBytes; // 元の画像を保存しておく用
 
+        // --- Config設定 ---
+        private ConfigEntry<bool> _pluginEnabled;
+        private ConfigEntry<KeyboardShortcut> _toggleKey;
+
+        private ConfigEntry<bool> _defaultExcited;
+        private ConfigEntry<bool> _defaultLipSync;
+        private ConfigEntry<bool> _defaultVoice;
+        private ConfigEntry<bool> _defaultBreath;
+
         private ConfigEntry<float> _windowX;
         private ConfigEntry<float> _windowY;
+
+        // 前回のフレームでの有効フラグの状態を保持する変数
+        private bool _lastPluginEnabledState = true;
 
         private float _lastSaveTime = 0f;
 
@@ -177,12 +191,23 @@ namespace KK_StudioVoice
         private VoiceTimelineCompat _timelineCompat;
 
         private bool _isInitialized = false; // 初期化完了フラグ
-
         private void Awake()
         {
-            // --- 設定ファイルの初期化 (Configのセクション名、キー名、デフォルト値、説明) ---
-            _windowX = Config.Bind("UI Settings", "WindowPositionX", 300f, "The X position of the voice player window.");
-            _windowY = Config.Bind("UI Settings", "WindowPositionY", 100f, "The Y position of the voice player window.");
+            // 1. プラグイン自体の有効・無効 ＆ ショートカットキー
+            _pluginEnabled = Config.Bind("General", "Enabled", true, "プラグインの有効/無効の切り替え");
+            _toggleKey = Config.Bind("General", "Hot Key", new KeyboardShortcut(KeyCode.None), "切り替えのショートカットキー");
+
+            // 2. 各トグルの初期値設定（Order を指定して画面上の並び順を上から固定）
+            _defaultExcited = Config.Bind("Default", "Excited", false, new ConfigDescription("Excited の初期値", null, new ConfigurationManagerAttributes { Order = 4 }));
+            _defaultLipSync = Config.Bind("Default", "LipSync", true, new ConfigDescription("LipSync の初期値", null, new ConfigurationManagerAttributes { Order = 3 }));
+            _defaultVoice = Config.Bind("Default", "Voice", true, new ConfigDescription("Voice の初期値", null, new ConfigurationManagerAttributes { Order = 2 }));
+            _defaultBreath = Config.Bind("Default", "Breath", true, new ConfigDescription("Breath の初期値", null, new ConfigurationManagerAttributes { Order = 1 }));
+
+            // --- 3. UI Window 位置 (F1メニュー非表示設定) ---
+            var hideInF1 = new ConfigDescription("UI Window Position", null, new ConfigurationManagerAttributes { Browsable = false });
+
+            _windowX = Config.Bind("UI", "WindowPositionX", 300f, hideInF1);
+            _windowY = Config.Bind("UI", "WindowPositionY", 100f, hideInF1);
 
             // 保存されていた座標を適用（幅320、高さ50は既存のまま）
             windowRect = new Rect(_windowX.Value, _windowY.Value, 320f, 50f);
@@ -228,8 +253,52 @@ namespace KK_StudioVoice
             _showPanel = false;
             UpdateToolbarIcon();
         }
+        private void Update()
+        {
+            // 設定キーのショートカット判定
+            if (_toggleKey.Value.IsDown())
+            {
+                _pluginEnabled.Value = !_pluginEnabled.Value;
+                Logger.LogMessage("StudioVoice " + (_pluginEnabled.Value ? "Enabled" : "Disabled"));
+            }
+            // 1. 有効 → 無効 に切り替わった瞬間（OFFにした時）
+            if (_lastPluginEnabledState && !_pluginEnabled.Value)
+            {
+                if (_player != null)
+                {
+                    _player.ResetAll(); // 即座に音声・コルーチンを物理停止
+                }
+            }
+            // 2. 無効 → 有効 に切り替わった瞬間（ONに戻した時）
+            else if (!_lastPluginEnabledState && _pluginEnabled.Value)
+            {
+                // 現在スタジオにいる全キャラから IsPlaying == true のキャラを探して再開
+                if (Singleton<Studio.Studio>.Instance != null)
+                {
+                    foreach (var pair in Singleton<Studio.Studio>.Instance.dicObjectCtrl)
+                    {
+                        if (pair.Value is OCIChar ociChar)
+                        {
+                            var targetGo = ociChar.guideObject.transformTarget.gameObject;
+                            var charaComp = targetGo.GetComponent<VoiceCharComponent>();
+
+                            // キャラが存在し、表示中で、再生フラグ（IsPlaying）がONなら再生を開始
+                            if (charaComp != null && charaComp.IsPlaying && charaComp.LastVisible)
+                            {
+                                RefreshVoice(charaComp);
+                            }
+                        }
+                    }
+                }
+            }
+            // 今のフレームの状態を記憶
+            _lastPluginEnabledState = _pluginEnabled.Value;
+        }
         private void LateUpdate()
         {
+            // プラグインが無効の場合は処理しない
+            if (!_pluginEnabled.Value) return;
+
             DetectSceneReload();
 
             if (_refreshRequests.Count > 0)
@@ -292,8 +361,20 @@ namespace KK_StudioVoice
                                 StartCoroutine(RefreshVoiceDelayed(charaComp, shouldResume));
                             }
                             // スタジオ上の現在の表示フラグを取得
-                            bool currentVisible = ociChar.treeNodeObject.visible;
+                            bool currentVisible = true;
+                            TreeNodeObject node = ociChar.treeNodeObject;
 
+                            // 親ノードを辿って、1つでも非表示（visible == false）があれば false にする
+                            while (node != null)
+                            {
+                                if (!node.visible)
+                                {
+                                    currentVisible = false;
+                                    break;
+                                }
+                                node = node.parent;
+                            }
+                            // 判定結果を使って処理
                             if (currentVisible != charaComp.LastVisible)
                             {
                                 charaComp.LastVisible = currentVisible;
@@ -411,7 +492,7 @@ namespace KK_StudioVoice
                 // ボタン作成
                 var myButton = new SimpleToolbarButton(
                     "VoicePlayerButton",
-                    "Voice Player",
+                    "KK_StudioVoice",
                     () => _toolbarIcon, // 常に同じテクスチャを返すが、中身が書き換わる
                     this,
                     _ => {
@@ -480,6 +561,13 @@ namespace KK_StudioVoice
                 comp.SetMode(_defaultMode);
                 comp.SetClip(_defaultClip);
                 comp.SetOption(_defaultOption);
+
+                // ★ F1で設定された初期値をコンポーネントに反映
+                comp.SetExcited(_defaultExcited.Value);
+                comp.SetLipSyncOn(_defaultLipSync.Value);
+                comp.SetVoiceOn(_defaultVoice.Value);
+                comp.SetBreathOn(_defaultBreath.Value);
+
                 Logger.LogInfo($"Added VoiceCharComponent to: {ociChar.charInfo.name}");
             }
             return comp;
@@ -495,7 +583,10 @@ namespace KK_StudioVoice
         }
         public void RefreshVoice(VoiceCharComponent chara)
         {
-            Debug.Log($"[VoicePlayer] ★リフレッシュを実行");
+            // プラグインが無効の場合は一切再生を受け付けない
+            if (!_pluginEnabled.Value)
+                return;
+
             if (chara == null || !chara.gameObject.activeInHierarchy)
                 return;
             // 非表示なら再生しない
@@ -542,22 +633,16 @@ namespace KK_StudioVoice
 
             if (isMouseInWindow || GUIUtility.hotControl != 0)
             {
-                // 1. スタジオ本体の入力をリセット
-                Input.ResetInputAxes();
-
-                // 2. カメラ制御の停止
+                // 1. カメラ制御の停止（マウスでのカメラ回転・移動を防ぐ）
                 var cameraCtrl = Studio.Studio.Instance != null ? Studio.Studio.Instance.cameraCtrl : null;
                 if (cameraCtrl != null && cameraCtrl.enabled)
                 {
                     cameraCtrl.enabled = false;
                     _cameraDisabledByMe = true;
                 }
-                // 3. ★KKPE方式：EventSystemを「操作中」としてマークする
-                // これにより、スタジオのツールバー等の Unity UI (Canvas) が反応しなくなります
+                // 2. スタジオUI（Canvas）への貫通防止
                 if (UnityEngine.EventSystems.EventSystem.current != null)
                 {
-                    // SetSelectedGameObject に自分のウィンドウ（あるいはダミー）を指定することで、
-                    // ツールバー側が「今は別の場所が操作されている」と判断し、貫通を防ぎます。
                     UnityEngine.EventSystems.EventSystem.current.SetSelectedGameObject(null);
                 }
             }
@@ -568,9 +653,9 @@ namespace KK_StudioVoice
             // --- ウィンドウ描画 ---
             Rect oldRect = windowRect; // ドラッグ前の座標を覚えておく
 
-            windowRect = GUI.Window(123456, windowRect, DrawVoicePanel, "🎤 Voice Player Control");
+            windowRect = GUI.Window(123456, windowRect, DrawVoicePanel, "KK_StudioVoice");
 
-            // ★修正版：座標が変わっていて、かつ前回の保存から0.5秒以上経っている場合だけ保存
+            // 座標が変わっていて、かつ前回の保存から0.5秒以上経っている場合だけ保存
             if (windowRect.x != oldRect.x || windowRect.y != oldRect.y)
             {
                 // Time.unscaledTime を使うことで、ゲームの一時停止中などでも正確に時間を測れます
@@ -580,12 +665,15 @@ namespace KK_StudioVoice
                     _windowY.Value = windowRect.y;
                     _lastSaveTime = Time.unscaledTime;
                 }
-            }            // --- 4. ★最強の防衛線：イベントの完全消費 ---
-            // 自分のウィンドウ内であれば、クリック（MouseDown）を含め全てのイベントをここで「Use」します。
-            // GUI.Window を呼んだ「後」であれば、中のボタンは既に反応済みなので問題ありません。
-            if (isMouseInWindow && Event.current.type != EventType.Layout && Event.current.type != EventType.Repaint)
+            }
+            // --- マウス操作（クリック等）だけをブロックし、キー入力は一切触らない ---
+            if (isMouseInWindow)
             {
-                Event.current.Use();
+                // キーボード関連イベント（isKey）は Use() せずスルーさせる
+                if (!Event.current.isKey && Event.current.type != EventType.Layout && Event.current.type != EventType.Repaint)
+                {
+                    Event.current.Use();
+                }
             }
         }
         private void RestoreState()

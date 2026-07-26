@@ -638,10 +638,12 @@ namespace KK_StudioVoice
         }
         public void ResetAll()
         {
-            foreach (var pair in _activeCoroutines)
+            foreach (var chara in _activeCoroutines.Keys.ToList())
             {
-                if (pair.Value != null)
-                    StopCoroutine(pair.Value);
+                if (chara != null)
+                {
+                    StopVoice(chara, true);
+                }
             }
             _activeCoroutines.Clear();
         }
