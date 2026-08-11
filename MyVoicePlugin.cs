@@ -1,18 +1,18 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
-using KKAPI.Studio.UI.Toolbars;
 using KKAPI.Utilities;
+using KKAPI.Studio.UI.Toolbars;
 using Studio;
 using System;
+using System.Linq;
 using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
-using System.Runtime.Remoting.Messaging;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace KK_StudioVoice
 {
-    [BepInPlugin("KK_StudioVoice", "KK_StudioVoice", "1.1.0")]
+    [BepInPlugin("KK_StudioVoice", "KK_StudioVoice", "1.2.0")]
     [BepInProcess("CharaStudio")]
     public class MyVoicePlugin : BaseUnityPlugin
     {
@@ -184,6 +184,7 @@ namespace KK_StudioVoice
         private bool showModeList = false;
         private bool showClipList = false;
         private bool showOptionList = false;
+
         private Vector2 scrollPosMode;
         private Vector2 scrollPosClip;
         private Vector2 scrollPosOption;
@@ -234,8 +235,26 @@ namespace KK_StudioVoice
                 _defaultMode = firstData.AnimeMode;
                 _defaultClip = firstData.AnimeClip;
             }
-            // ★ ここに追加：自動開閉処理をスタート
+            // 自動開閉処理をスタート
             StartCoroutine(AutoOpenAndCloseWindow());
+
+            SceneManager.sceneUnloaded += OnSceneUnloadedForVoice;
+        }
+        private void OnSceneUnloadedForVoice(Scene scene)
+        {
+            try
+            {
+                // プレイヤーが MonoBehaviour ならコルーチンを止める
+                if (_player != null)
+                {
+                    try { _player.StopAllCoroutines(); } catch { }
+                    try { _player.ResetAll(); } catch { } // ResetAll があれば内部状態をクリア
+                }
+            }
+            catch (Exception e)
+            {
+                SLog.Log.LogWarning($"[KK_StudioVoice] OnSceneUnloadedForVoice error: {e}");
+            }
         }
         private IEnumerator AutoOpenAndCloseWindow()
         {
@@ -259,7 +278,7 @@ namespace KK_StudioVoice
             if (_toggleKey.Value.IsDown())
             {
                 _pluginEnabled.Value = !_pluginEnabled.Value;
-                Logger.LogMessage("StudioVoice " + (_pluginEnabled.Value ? "Enabled" : "Disabled"));
+                SLog.Log.LogMessage("StudioVoice " + (_pluginEnabled.Value ? "Enabled" : "Disabled"));
             }
             // 1. 有効 → 無効 に切り替わった瞬間（OFFにした時）
             if (_lastPluginEnabledState && !_pluginEnabled.Value)
@@ -277,16 +296,42 @@ namespace KK_StudioVoice
                 {
                     foreach (var pair in Singleton<Studio.Studio>.Instance.dicObjectCtrl)
                     {
-                        if (pair.Value is OCIChar ociChar)
+                        // 1イテレーションを try/catch で保護して、1つのオブジェクトの例外で処理が止まらないようにする
+                        try
                         {
-                            var targetGo = ociChar.guideObject.transformTarget.gameObject;
+                            if (pair.Value == null) continue;
+
+                            if (!(pair.Value is OCIChar ociChar)) continue;
+
+                            // null 安全に guideObject / transformTarget / gameObject をたどる
+                            var guide = ociChar.guideObject;
+                            if (guide == null) continue;
+
+                            var transformTarget = guide.transformTarget;
+                            if (transformTarget == null) continue;
+
+                            var targetGo = transformTarget.gameObject;
+                            if (targetGo == null) continue;
+
+                            // キャラコンポーネントを取得（無ければスキップ）
                             var charaComp = targetGo.GetComponent<VoiceCharComponent>();
+                            if (charaComp == null) continue;
+
+                            // 追加の安全チェック：charInfo や LastVisible 参照で NRE を防ぐ
+                            bool lastVisible = false;
+                            try { lastVisible = charaComp.LastVisible; } catch { lastVisible = false; }
 
                             // キャラが存在し、表示中で、再生フラグ（IsPlaying）がONなら再生を開始
-                            if (charaComp != null && charaComp.IsPlaying && charaComp.LastVisible)
+                            if (charaComp.IsPlaying && lastVisible)
                             {
                                 RefreshVoice(charaComp);
                             }
+                        }
+                        catch (Exception ex)
+                        {
+                            // ここではログを出すが処理は続行する
+                            SLog.Log.LogWarning($"[KK_StudioVoice]dicObjectCtrlのスキャン中にエラーが発生しました。: {ex}");
+                            continue;
                         }
                     }
                 }
@@ -329,11 +374,19 @@ namespace KK_StudioVoice
                     {
                         // キャラクターに付いているコンポーネントを取得
                         var targetGo = ociChar.guideObject.transformTarget.gameObject;
+                        // まず既存のコンポーネントを取得
                         var charaComp = targetGo.GetComponent<VoiceCharComponent>();
 
-                        if (charaComp != null)
+                        // 無ければ安全条件を満たすときだけ自動付与を試みる
+                        if (charaComp == null)
                         {
-                            int currentPersonality =
+                            charaComp = AttachVoiceCharComponentSafely(targetGo);
+                        }
+
+                        // charaComp が取れなければスキップ（元と同等の動作）
+                        if (charaComp == null)
+                            continue;
+                        int currentPersonality =
                                 ociChar.charInfo.chaFile.parameter.personality;
 
                             // 初回
@@ -344,8 +397,6 @@ namespace KK_StudioVoice
                             // 置換検知
                             else if (charaComp.LastPersonality != currentPersonality)
                             {
-                                Debug.Log($"[Voice] キャラ置換検知: {ociChar.charInfo.name}");
-
                                 charaComp.LastPersonality = currentPersonality;
 
                                 bool shouldResume = charaComp.IsPlaying;
@@ -380,7 +431,6 @@ namespace KK_StudioVoice
                                 charaComp.LastVisible = currentVisible;
                                 if (currentVisible)
                                 {
-                                    Debug.Log($"表示: {ociChar.charInfo.name}");
                                     if (charaComp.IsPlaying)
                                     {
                                         _player.StopVoice(charaComp);
@@ -389,13 +439,57 @@ namespace KK_StudioVoice
                                 }
                                 else
                                 {
-                                    Debug.Log($"非表示: {ociChar.charInfo.name}");
                                     _player.StopVoice(charaComp, true);
                                 }
                             }
                         }
                     }
                 }
+            }
+        private void OnDestroy()
+        {
+            try { SceneManager.sceneUnloaded -= OnSceneUnloadedForVoice; } catch { }
+            try { _timelineCompat?.Dispose(); } catch { }
+        }
+        private VoiceCharComponent AttachVoiceCharComponentSafely(GameObject go)
+        {
+            if (go == null) return null;
+            // アクティブでないオブジェクトには付けない
+            if (!go.activeInHierarchy) return null;
+
+            // scene チェック（アンロード中のオブジェクトを避ける）
+            try
+            {
+                var scene = go.scene;
+                if (!scene.IsValid() || !scene.isLoaded) return null;
+            }
+            catch
+            {
+                return null;
+            }
+
+            // 既に付いていればそれを返す
+            var comp = go.GetComponent<VoiceCharComponent>();
+            if (comp != null) return comp;
+
+            // ここで安全に追加して初期化
+            try
+            {
+                comp = go.AddComponent<VoiceCharComponent>();
+                // 初期値を反映（既存 GetActiveCharacterComponent と同じ初期化）
+                comp.SetMode(_defaultMode);
+                comp.SetClip(_defaultClip);
+                comp.SetOption(_defaultOption);
+                comp.SetExcited(_defaultExcited.Value);
+                comp.SetLipSyncOn(_defaultLipSync.Value);
+                comp.SetVoiceOn(_defaultVoice.Value);
+                comp.SetBreathOn(_defaultBreath.Value);
+                return comp;
+            }
+            catch (Exception e)
+            {
+                SLog.Log.LogWarning($"[KK_StudioVoice]AttachVoiceCharComponentSafelyが失敗しました。: {e}");
+                return null;
             }
         }
         private IEnumerator RefreshVoiceDelayed(
@@ -424,17 +518,14 @@ namespace KK_StudioVoice
 
                 yield return null;
             }
-
             if (!_cacheManager.IsLoaded(pId))
             {
-                Debug.LogWarning($"[Voice] ロードタイムアウト: personality={pId}");
+                SLog.Log.LogWarning($"[Voice] ロードタイムアウト: personality={pId}");
                 yield break;
             }
 
             if (!charaComp.gameObject.activeInHierarchy)
                 yield break;
-
-            Debug.Log("[Voice] キャッシュロード完了 → RefreshVoice");
 
             RefreshVoice(charaComp);
         }
@@ -452,19 +543,14 @@ namespace KK_StudioVoice
                 _lastObjectCount = currentCount;
                 return;
             }
-
             // オブジェクト数が激変したらシーンロード扱い
             if (Mathf.Abs(currentCount - _lastObjectCount) > 5)
             {
-                Debug.Log("[KK_StudioVoice] Scene reload detected");
-
                 _player.ResetAll();
             }
-
             _lastObjectCount = currentCount;
         }
         //　アイコンの生成
-        // --- AddButtonSafe メソッド ---
         private IEnumerator AddButtonSafe()
         {
             yield return new WaitForSeconds(1.0f);
@@ -488,7 +574,6 @@ namespace KK_StudioVoice
                             _toolbarIcon.SetPixel(x, y, Color.gray);
                     _toolbarIcon.Apply();
                 }
-
                 // ボタン作成
                 var myButton = new SimpleToolbarButton(
                     "VoicePlayerButton",
@@ -497,15 +582,13 @@ namespace KK_StudioVoice
                     this,
                     _ => {
                         _showPanel = !_showPanel;
-                        UpdateToolbarIcon(); // ★クリック時に中身を書き換える
+                        UpdateToolbarIcon(); // クリック時に中身を書き換える
                     }
                 );
-
                 ToolbarManager.AddLeftToolbarControl(myButton);
             }
-            catch (Exception e) { Logger.LogError($"Toolbar Error: {e.Message}"); }
+            catch (Exception e) { SLog.Log.LogError($"Toolbar Error: {e.Message}"); }
         }
-
         // --- アイコンの色を直接上書きするメソッド ---
         private void UpdateToolbarIcon()
         {
@@ -513,8 +596,6 @@ namespace KK_StudioVoice
 
             if (_showPanel)
             {
-                // ターゲットの色。RとBを少し混ぜることで、
-                // 単純な真緑(0,1,0)よりも目に馴染む、他のプラグインに近い緑になります。
                 Color activeGreen = new Color(0.2f, 1.0f, 0.2f, 1.0f);
 
                 Color[] pixels = _toolbarIcon.GetPixels();
@@ -522,11 +603,9 @@ namespace KK_StudioVoice
                 {
                     Color c = pixels[i];
 
-                    // ★ S字補正を使わず、単純な乗算のみ。
-                    // 係数を「1.1f」にすることで、薄すぎず濃すぎない中間の発光感を出します。
                     pixels[i] = new Color(
                         c.r * activeGreen.r,
-                        c.g * activeGreen.g * 1.1f, // ここでわずかに強調
+                        c.g * activeGreen.g * 1.1f,
                         c.b * activeGreen.b,
                         c.a
                     );
@@ -544,33 +623,18 @@ namespace KK_StudioVoice
         /// /// コンポーネントが存在しない場合は、その場で新しく追加します。
         public VoiceCharComponent GetActiveCharacterComponent()
         {
-            // 現在スタジオで選択中のキャラクター（最初の1人）を取得
             var ociChar = KKAPI.Studio.StudioAPI.GetSelectedCharacters().FirstOrDefault();
             if (ociChar == null) return null;
 
-            // キャラクターの本体（transformTarget）からコンポーネントを探す
-            // ※ スタジオのOCICharは guideObject.transformTarget に GameObject が紐付いています
-            var targetGo = ociChar.guideObject.transformTarget.gameObject;
+            var targetGo = ociChar?.guideObject?.transformTarget?.gameObject;
+            if (targetGo == null) return null;
+
+            // まず既存のコンポーネントを返す（副作用なし）
             var comp = targetGo.GetComponent<VoiceCharComponent>();
+            if (comp != null) return comp;
 
-            // なければ新しく付与する
-            if (comp == null)
-            {
-                comp = targetGo.AddComponent<VoiceCharComponent>();
-                // ここで初期値をセット
-                comp.SetMode(_defaultMode);
-                comp.SetClip(_defaultClip);
-                comp.SetOption(_defaultOption);
-
-                // ★ F1で設定された初期値をコンポーネントに反映
-                comp.SetExcited(_defaultExcited.Value);
-                comp.SetLipSyncOn(_defaultLipSync.Value);
-                comp.SetVoiceOn(_defaultVoice.Value);
-                comp.SetBreathOn(_defaultBreath.Value);
-
-                Logger.LogInfo($"Added VoiceCharComponent to: {ociChar.charInfo.name}");
-            }
-            return comp;
+            // 無ければ安全付与して返す（Attach 内で安全チェック済み）
+            return AttachVoiceCharComponentSafely(targetGo);
         }
         private string NormalizeOption(string opt)
         {
@@ -608,7 +672,7 @@ namespace KK_StudioVoice
 
             var chaCtrl = chara.GetComponentInParent<ChaControl>();
 
-            // 4. 再生を実行（charaを渡すことで、Player側で監視できるようにする）
+            // 再生を実行（charaを渡すことで、Player側で監視できるようにする）
             _player.PlaySelectedVoice(
                 chara,
                 chaCtrl,
@@ -715,7 +779,7 @@ namespace KK_StudioVoice
                         if (!_dataLoader.VoiceDataList.Any(d => d.AnimeMode == m && d.AnimeClip == SelectedClip))
                             SelectedClip = _dataLoader.VoiceDataList.First(d => d.AnimeMode == m).AnimeClip;
 
-                        // ★ 現在Optionが存在しなければNoneへ
+                        // 現在Optionが存在しなければNoneへ
                         bool optionExists = _dataLoader.VoiceDataList.Any(d =>
                             d.AnimeMode == SelectedMode &&
                             d.AnimeClip == SelectedClip &&
@@ -752,7 +816,7 @@ namespace KK_StudioVoice
                     {
                         SelectedClip = c;
                         showClipList = false;
-                        // ★ 現在Optionが存在しなければNoneへ
+                        // 現在Optionが存在しなければNoneへ
                         bool optionExists = _dataLoader.VoiceDataList.Any(d =>
                             d.AnimeMode == SelectedMode &&
                             d.AnimeClip == SelectedClip &&
@@ -838,18 +902,25 @@ namespace KK_StudioVoice
             string btnText = IsPlaying ? "STOP ■" : "PLAY ▶";
 
             if (GUI.Button(new Rect(x, currentY, w, 40f), btnText))
-            {
-                // プロパティを反転させるだけで、中の setter が動き 
+            {// プロパティを反転させるだけで、中の setter が動き 
                 // RefreshVoice(chara) もしくは StopVoice(chara) が自動で呼ばれる
                 IsPlaying = !IsPlaying;
             }
-            // --- 6. 閉じるボタン ---
-            GUI.backgroundColor = Color.white;
             currentY += 45f;
-            if (GUI.Button(new Rect(x, currentY, w, 25f), "閉じる"))
+
+            // --- 6. タイムラインへのキーフレーム追加ボタン ---
+            GUI.backgroundColor = Color.white;
+            if (GUI.Button(new Rect(x, currentY, w, 25f), "Add Timeline Keys"))
+            {
+                _timelineCompat?.AddStudioVoiceKeyframes();
+            }
+            currentY += 30f;
+
+            // --- 7. 閉じるボタン ---
+            if (GUI.Button(new Rect(x, currentY, w, 25f), "Close"))
             {
                 _showPanel = false;
-                UpdateToolbarIcon(); // ★ここでも呼び出して色を戻す
+                UpdateToolbarIcon(); // ここでも呼び出して色を戻す
             }
             windowRect.height = currentY + 30f;
         }

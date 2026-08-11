@@ -1,9 +1,4 @@
-﻿using Studio;
-using System.Collections;
-using System.Collections.Generic;
-using System.Linq;
-using UnityEngine;
-using static ADV.Info;
+﻿using UnityEngine;
 
 namespace KK_StudioVoice
 {

@@ -1,8 +1,7 @@
-﻿using BepInEx;
-using System;
-using System.Collections.Generic;
+﻿using System;
 using System.IO;
 using System.Text;
+using System.Collections.Generic;
 
 namespace KK_StudioVoice
 {
@@ -24,25 +23,20 @@ namespace KK_StudioVoice
         // 解析済みのIDリスト（後の再生処理で使いやすくするため）
         public List<string> ParsedVoiceIDs = new List<string>();
     }
-
     // --- 2. 読み込みロジックの定義 ---
     public class VoiceDataLoader
     {
         private List<VoiceData> _voiceDataList = new List<VoiceData>();
         public List<VoiceData> VoiceDataList => _voiceDataList;
-
-        private BepInEx.Logging.ManualLogSource Logger = BepInEx.Logging.Logger.CreateLogSource("VoiceDataLoader");
-
         public void LoadCsv(string csvPath)
         {
             _voiceDataList.Clear();
 
             if (!File.Exists(csvPath))
             {
-                Logger.LogError($"CSVファイルが見つかりません: {csvPath}");
+                SLog.Log.LogError($"CSVファイルが見つかりません: {csvPath}");
                 return;
             }
-
             try
             {
                 // UTF-8で読み込み
@@ -77,11 +71,10 @@ namespace KK_StudioVoice
 
                     _voiceDataList.Add(data);
                 }
-                Logger.LogInfo($"CSV読み込み完了: {_voiceDataList.Count}件のデータをロードしました。");
             }
             catch (Exception e)
             {
-                Logger.LogError($"CSVの読み込み中にエラーが発生しました: {e.Message}");
+                SLog.Log.LogError($"CSVの読み込み中にエラーが発生しました: {e.Message}");
             }
         }
         private string NormalizeOption(string opt)
@@ -101,6 +94,7 @@ namespace KK_StudioVoice
             var data = FindInternal(mode, clip, option, excited);
             if (data != null)
                 return data;
+
             // ② Option一致 + 非Excited
             data = FindInternal(mode, clip, option, !excited);
             if (data != null)
@@ -120,7 +114,6 @@ namespace KK_StudioVoice
                 if (data != null)
                     return data;
             }
-
             return null;
         }
         private VoiceData FindInternal(string mode, string clip, string option, bool excited)
@@ -133,7 +126,7 @@ namespace KK_StudioVoice
             {
                 if (data.AnimeMode != mode || data.AnimeClip != clip)
                     continue;
-                // ★Option一致
+                // Option一致
                 string dataOpt = NormalizeOption(data.Option);
                 if (dataOpt != option)
                     continue;
@@ -237,7 +230,6 @@ namespace KK_StudioVoice
             }
             return result;
         }
-
         private string GetValue(string[] array, int index)
         {
             if (index >= array.Length) return "";

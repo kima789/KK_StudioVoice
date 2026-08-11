@@ -1,16 +1,13 @@
-﻿using HarmonyLib;
-using System;
+﻿using System;
+using System.Linq;
 using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
 using UnityEngine;
 
 namespace KK_StudioVoice
 {
     public class VoicePlayer : MonoBehaviour
     {
-        private BepInEx.Logging.ManualLogSource Logger => BepInEx.Logging.Logger.CreateLogSource("VoicePlayer");
         private readonly Dictionary<VoiceCharComponent, Coroutine> _activeCoroutines = new Dictionary<VoiceCharComponent, Coroutine>();
         private VoiceCacheManager _cache;
 
@@ -30,6 +27,17 @@ namespace KK_StudioVoice
             bool playVoice,
             bool playBreath)
         {
+            if (chara == null)
+            {
+                // フォールバック: charaComp から親の ChaControl を探す
+                if (charaComp != null)
+                    chara = charaComp.GetComponentInParent<ChaControl>() ?? charaComp.GetComponent<ChaControl>();
+                if (chara == null)
+                {
+                    SLog.Log.LogWarning("[KK_StudioVoice] PlaySelectedVoice: ChaControl が取得できません。再生を中断します。");
+                    return;
+                }
+            }
             var voiceData = GetLatestVoiceData(
                 charaComp,
                 loader,
@@ -38,7 +46,6 @@ namespace KK_StudioVoice
                 baseExp,
                 true
             );
-
             var breathData = GetLatestVoiceData(
                 charaComp,
                 loader,
@@ -47,8 +54,7 @@ namespace KK_StudioVoice
                 baseExp,
                 false
             );
-
-            // ★どちらも無ければ再生しない
+            // どちらも無ければ再生しない
             if (voiceData == null && breathData == null)
                 return;
 
@@ -119,7 +125,7 @@ namespace KK_StudioVoice
                     );
                 if (shouldOverrideVoice)
                 {
-                    // ★ 古い予約を破棄
+                    // 古い予約を破棄
                     charaComp.ReservedNextAction = null;
 
                     StopVoice(charaComp);
@@ -134,7 +140,7 @@ namespace KK_StudioVoice
             // ブレス中 or 再生中
             if (charaComp.IsPlaying)
             {
-                // ★ 古い予約を破棄
+                // 古い予約を破棄
                 charaComp.ReservedNextAction = null;
 
                 StopVoice(charaComp);
@@ -165,7 +171,7 @@ namespace KK_StudioVoice
 
             Setup3DSound(asVoice);
 
-            // ★ 両方なければ終了
+            // 両方なければ終了
             if (voiceData == null && breathData == null)
                 yield break;
 
@@ -197,9 +203,9 @@ namespace KK_StudioVoice
             // ブレスループ
             if (playBreath)
             {
-                while (charaComp.IsPlaying)
+                while (charaComp.IsPlaying && charaComp.IsBreathOn)
                 {
-                    // ★毎回最新状態から取得
+                    // 毎回最新状態から取得
                     breathData = GetLatestVoiceData(
                         charaComp,
                         loader,
@@ -236,7 +242,7 @@ namespace KK_StudioVoice
             }
             charaComp.IsCurrentNotLoop = false;
 
-            // ★先に自分を管理解除
+            // 先に自分を管理解除
             _activeCoroutines.Remove(charaComp);
 
             if (charaComp.ReservedNextAction != null)
@@ -288,21 +294,18 @@ namespace KK_StudioVoice
             // 1段階フォールバックのみ
             for (int i = 0; i < 2; i++)
             {
-                // ★ここで順番に試す
+                // ここで順番に試す
                 string[] optionsToTry = option == "None"
                     ? new[] { "None" }
                     : new[] { option, "None" };
 
                 foreach (var opt in optionsToTry)
                 {
-                    // ★Excitedの2パターン取得（元とフォールバック）
+                    // Excitedの2パターン取得（元とフォールバック）
                     var dataPrimary = loader.Get(currentMode, clip, opt, excited);
                     var dataFallback = loader.Get(currentMode, clip, opt, false);
 
-                    Debug.Log($"[DEBUG②] mode:{currentMode} opt:{opt} ex:{excited} → {(dataPrimary == null ? "NULL" : "OK")}");
-                    Debug.Log($"[DEBUG②] mode:{currentMode} opt:{opt} ex:false → {(dataFallback == null ? "NULL" : "OK")}");
-
-                    // ★ Voice探索
+                    // Voice探索
                     if (forVoice)
                     {
                         // ===== excited 現在値 =====
@@ -334,7 +337,7 @@ namespace KK_StudioVoice
                                 return dataFallback;
                         }
                     }
-                    // ★ Breath探索
+                    // Breath探索
                     else
                     {
                         // ===== excited 現在値 =====
@@ -378,28 +381,73 @@ namespace KK_StudioVoice
             VoiceCharComponent charaComp,
             ChaControl chara,
             AudioSource asVoice,
-            List<AssetBundle> bundles, 
-            string prefix, 
-            string pNum, 
-            int baseExp, 
+            List<AssetBundle> bundles,
+            string prefix,
+            string pNum,
+            int baseExp,
             string rawId,
             bool isVoice)
         {
-            List<string> ids = ParseExtendedIDs(rawId);
-            Debug.Log($"[DEBUG⑥] rawId:{rawId} → ids:{string.Join(",", ids.ToArray())}"); if (ids.Count == 0)
+            // safety checks: シーン再読み込み等で参照が消える可能性があるので防御的に戻す
+            if (chara == null || chara.gameObject == null)
+                yield break;
+
+            // chaCtrl の取得
+            var chaCtrl = chara.GetComponentInParent<ChaControl>() ?? chara;
+            if (chaCtrl == null)
+                yield break;
+
+            int pId = chaCtrl.chaFile.parameter.personality;
+            string pNumLocal = $"{pId:00}";
+            var bundlesLocal = _cache.GetAllBundles(pId);
+
+            // asVoice は外から渡される想定だが念のため null ガード
+            if (asVoice == null)
             {
-                Debug.LogWarning($"[PlayClipInternal] 再生対象のIDが空です (Prefix: {prefix})");
+                // 代替としてコンポーネントから取得（なければ作成）
+                if (charaComp != null && charaComp.gameObject != null)
+                {
+                    asVoice = charaComp.GetComponent<AudioSource>();
+                    if (asVoice == null)
+                        asVoice = charaComp.gameObject.AddComponent<AudioSource>();
+                    Setup3DSound(asVoice);
+                }
+                else
+                {
+                    yield break;
+                }
+            }
+            // 両方なければ終了
+            if (isVoice && bundlesLocal == null && bundles == null)
+                yield break;
+
+            // IDs 展開と選択処理
+            List<string> ids = ParseExtendedIDs(rawId);
+            if (ids.Count == 0)
+            {
+                SLog.Log.LogWarning($"[PlayClipInternal] 再生対象のIDが空です。(Prefix: {prefix})");
                 yield break;
             }
-            // ★前回ID取得（prefixで判定してもOK）
+            // 前回ID取得（prefixで判定してもOK）
             string lastId = isVoice ? charaComp.LastPlayedVoiceId : charaComp.LastPlayedBreathId;
 
-            // ★有効ID抽出（Exp完全一致のみ）
+            // 有効ID抽出（Exp完全一致のみ）
             List<string> validIds = new List<string>();
 
+            // 渡されたバンドルが利用可能な場合はそれを使用し、そうでない場合は bundlesLocal を使用
+            var effectiveBundles = bundles ?? bundlesLocal;
+            if (effectiveBundles == null)
+            {
+                SLog.Log.LogWarning("[PlayClipInternal] アセットバンドルがnullです。処理を中止します。");
+                yield break;
+            }
             foreach (var id in ids)
             {
-                foreach (var b in bundles)
+                // 各フレームで参照が失われていないかチェック
+                if (charaComp == null || charaComp.gameObject == null)
+                    yield break;
+
+                foreach (var b in effectiveBundles)
                 {
                     if (ExistsClipExact(b, prefix, pNum, baseExp, id))
                     {
@@ -408,26 +456,28 @@ namespace KK_StudioVoice
                     }
                 }
             }
-            // ★1つでもあればそれだけ使う（fallbackしない）
+            // 1つでもあればそれだけ使う（fallbackしない）
             var workingIds = validIds.Count > 0 ? validIds : ids;
 
-
-            // ★同じIDを除外（ただし1個しかない場合は除外しない）
+            // 同じIDを除外（ただし1個しかない場合は除外しない）
             var candidates = workingIds.Count > 1
                 ? workingIds.Where(id => id != lastId).ToList()
                 : new List<string>(workingIds);
 
-            // ★シャッフル
+            // シャッフル
             var shuffledIds = candidates.OrderBy(_ => UnityEngine.Random.value).ToList();
             AudioClip clip = null;
             string selectedId = null;
 
             foreach (var id in shuffledIds)
             {
-                foreach (var b in bundles)
+                // ループごとにシーン/オブジェクトが存在するかチェック
+                if (charaComp == null || charaComp.gameObject == null)
+                    yield break;
+
+                foreach (var b in effectiveBundles)
                 {
                     clip = FindClip(b, prefix, pNum, baseExp, id);
-                    Debug.Log($"[DEBUG⑦] clip結果: {(clip == null ? "NULL" : clip.name)}");
                     if (clip != null)
                     {
                         selectedId = id;
@@ -444,7 +494,10 @@ namespace KK_StudioVoice
             }
             if (clip != null)
             {
-                Debug.Log($"[PlayClipInternal] Clip再生: {clip.name}");
+                // 再生前に再度 null チェック
+                if (charaComp == null || charaComp.gameObject == null || asVoice == null)
+                    yield break;
+
                 asVoice.Stop();
                 asVoice.clip = clip;
 
@@ -453,17 +506,27 @@ namespace KK_StudioVoice
 
                 // 別クラスのコントローラーにリップシンクを丸投げする
                 // StartCoroutine ではなく、コントローラー側のメソッドを呼ぶだけ
-                if (LipSyncController.Instance != null)
+                try
                 {
-                    LipSyncController.Instance.StartLipSync(chara, asVoice);
+                    if (LipSyncController.Instance != null && chaCtrl != null && asVoice != null)
+                    {
+                        LipSyncController.Instance.StartLipSync(chaCtrl, asVoice);
+                    }
+                }
+                catch (Exception e)
+                {
+                    SLog.Log.LogWarning($"[KK_StudioVoice] リップシンクの開始に失敗しました。: {e}");
                 }
                 // 「投げっぱなしにしない」場合は、ここで音声終了を待つ
-                while (asVoice.isPlaying) yield return null;
-                Debug.Log($"[PlayClipInternal] Clip終了: {clip.name}");
+                while (asVoice != null && asVoice.isPlaying && charaComp != null && charaComp.gameObject != null)
+                {
+                    // ループ内でも参照が失われたら安全に抜ける
+                    yield return null;
+                }
             }
             else
             {
-                Debug.LogError($"[PlayClipInternal] Clipが見つかりませんでした: {prefix}_{rawId}");
+                SLog.Log.LogError($"[PlayClipInternal] Clipが見つかりませんでした。: {prefix}_{rawId}");
                 yield break;
             }
         }
@@ -482,7 +545,6 @@ namespace KK_StudioVoice
             {
                 return bundle.LoadAsset<AudioClip>($"{prefix}_{pNum}_{clipId}") != null;
             }
-
             return bundle.LoadAsset<AudioClip>($"{prefix}_{pNum}_{baseExp:D2}_{clipId}") != null;
         }
         // --- 停止処理 ---
@@ -510,7 +572,7 @@ namespace KK_StudioVoice
             var cha = chara.GetComponentInParent<ChaControl>() ?? chara.GetComponent<ChaControl>();
             if (cha != null)
             {
-                // --- 徹底的な物理停止（ここが復活した「止める」ための核） ---
+                // --- 徹底的な物理停止 ---
                 foreach (var source in cha.gameObject.GetComponentsInChildren<AudioSource>(true))
                 {
                     if (source != null)
@@ -633,7 +695,7 @@ namespace KK_StudioVoice
         {
             if (chara == null || chara.fileParam == null)
                 return 1f;
-            // ★コイカツのボイスピッチ
+            // コイカツのボイスピッチ
             return chara.fileParam.voicePitch;
         }
         public void ResetAll()
