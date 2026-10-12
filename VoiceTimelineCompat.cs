@@ -20,7 +20,6 @@ namespace KK_StudioVoice
             voicePlugin = plugin;
             SceneManager.sceneLoaded += OnSceneLoaded;
         }
-
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
             // Studioロード時のみ追加
@@ -64,7 +63,6 @@ namespace KK_StudioVoice
                     // Scene API で例外が出る可能性があるため握る
                     return null;
                 }
-
                 // 既存のコンポーネントを返す（破棄時に AddComponent はしない）
                 return go.GetComponent<VoiceCharComponent>();
             }
@@ -324,6 +322,45 @@ namespace KK_StudioVoice
                 null, null, true,
                 (currentName, oci, param) => "Breath ON/OFF", null
             );
+            // Volume
+            TimelineCompatibility.AddInterpolableModelDynamic(
+                "KK_StudioVoice", "Volume", "Volume",
+                (oci, param, left, right, f) =>
+                {
+
+                    float lVal = left != null ? Convert.ToSingle(left) : 1f;
+                    float rVal = right != null ? Convert.ToSingle(right) : 1f;
+                    float val = Mathf.Lerp(lVal, rVal, f);
+
+                    var chara = GetVoiceComponent(oci);
+                    if (chara != null)
+                    {
+                        if (chara.SetVolume(val))
+                        {
+                            var activeSource = chara.GetComponentInChildren<AudioSource>();
+                            if (activeSource != null) activeSource.volume = val;
+
+                            // もし現在選択中のキャラクターであれば、プラグイン側のボリューム表示も同期する
+                            if (chara == voicePlugin.GetActiveCharacterComponent())
+                            {
+                                voicePlugin.SelectedVolumeSyncFromTimeline(chara, val);
+                            }
+                        }
+                    }
+                },
+                null,
+                oci => oci is OCIChar,
+                (oci, param) =>
+                {
+                    var chara = GetVoiceComponent(oci);
+                    return chara != null ? (object)chara.Volume : (object)1.0f;
+                },
+                (param, node) => XmlConvert.ToSingle(node.Attributes["value"].Value),
+                (param, writer, value) => writer.WriteAttributeString("value", XmlConvert.ToString((float)value)),
+                oci => null,
+                (oci, node) => null,
+                null, null, true,
+                (currentName, oci, param) => "Volume", null);
             // Play (再生ON/OFF)
             TimelineCompatibility.AddInterpolableModelDynamic(
                 "KK_StudioVoice", "Play", "Sound ON/OFF",
@@ -340,7 +377,6 @@ namespace KK_StudioVoice
                             {
                                 voicePlugin.IsPlaying = play;
                             }
-
                             // 選択・非選択に関わらず、値が変わった瞬間はRefreshVoiceが必要
                             voicePlugin.RequestRefresh(chara);
                         }
@@ -401,7 +437,6 @@ namespace KK_StudioVoice
             // その後、即時処理を行う
             AddStudioVoiceKeyframes_Immediate(selected);
         }
-
         private void AddStudioVoiceKeyframes_Immediate(ObjectCtrlInfo selected)
         {
             try
@@ -542,12 +577,12 @@ namespace KK_StudioVoice
             { "LipSync",    (object)charComp.IsLipSyncOn },
             { "Voice",      (object)charComp.IsVoiceOn },
             { "Breath",     (object)charComp.IsBreathOn },
+            { "Volume",     (object)charComp.Volume },
             { "Play",       (object)charComp.IsPlaying }
         };
                 // timeline の AddInterpolable を探す（優先して使う）
                 var addInterpolableMethod = timelineType.GetMethod("AddInterpolable", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                                             ?? timelineType.GetMethod("AddInterpolable", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-
                 // timeline.AddKeyframe メソッドも探す
                 MethodInfo addKeyframeMethod = timelineType.GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
                     .FirstOrDefault(m => m.Name == "AddKeyframe" && m.GetParameters().Length >= 2);
@@ -582,14 +617,7 @@ namespace KK_StudioVoice
                                 interpolable = addInterpolableMethod.Invoke(target, new object[] { model, null });
                             }
                         }
-                        catch (TargetInvocationException tie)
-                        {
-                            SLog.Log.LogWarning($"[KK_StudioVoice] timeline.AddInterpolable 呼び出しで例外 (model:{modelId}): {tie.InnerException?.Message ?? tie.Message}");
-                        }
-                        catch (Exception e)
-                        {
-                            SLog.Log.LogWarning($"[KK_StudioVoice] timeline.AddInterpolable 呼び出し失敗 (model:{modelId}): {e.Message}");
-                        }
+                        catch{}
                     }
                     // もし AddInterpolable が無かったり失敗した場合は、model にある getParameter デリゲートを試して parameter を取得しつつ new する
                     if (interpolable == null)
@@ -617,7 +645,6 @@ namespace KK_StudioVoice
                                     try { parameter = getParamMethod.Invoke(model, new object[] { selected }); } catch { parameter = null; }
                                 }
                             }
-
                             var interpolableType = timelineAsm.GetTypes().FirstOrDefault(tt => tt.Name == "Interpolable");
                             if (interpolableType != null)
                             {
@@ -630,21 +657,14 @@ namespace KK_StudioVoice
                                         object paramToUse = parameter ?? selected;
                                         interpolable = ctor.Invoke(new object[] { selected, paramToUse, model });
                                     }
-                                    catch (Exception e)
-                                    {
-                                        SLog.Log.LogWarning($"[KK_StudioVoice] Interpolable コンストラクタ呼び出し失敗 (model:{modelId}): {e.Message}");
-                                    }
+                                    catch{}
                                 }
                             }
                         }
-                        catch (Exception e)
-                        {
-                            SLog.Log.LogWarning($"[KK_StudioVoice] Interpolable の代替生成に失敗 (model:{modelId}): {e.Message}");
-                        }
+                        catch{}
                     }
                     if (interpolable == null)
                     {
-                        SLog.Log.LogWarning($"[KK_StudioVoice] モデル '{modelId}' に対する Interpolable を取得／生成できませんでした。スキップします。");
                         continue;
                     }
                     // --- ここから：直前キーと比較して差分のみ打ち込むロジック ---
@@ -680,25 +700,18 @@ namespace KK_StudioVoice
 
                             added++;
                         }
-                        catch (TargetInvocationException tie)
+                        catch (TargetInvocationException)
                         {
-                            SLog.Log.LogWarning($"[KK_StudioVoice] AddKeyframe 呼び出しで例外 (model {modelId}): {tie.InnerException?.Message ?? tie.Message}. フォールバック処理に切替えます。");
-
                             // フォールバック: Keyframe を自前生成して interpolable.keyframes に追加
                             try
                             {
                                 var keyframeType = timelineAsm.GetTypes().FirstOrDefault(t => t.Name == "Keyframe");
                                 if (keyframeType == null)
                                 {
-                                    SLog.Log.LogError("[KK_StudioVoice] Keyframe 型が見つかりません。（フォールバック不可）");
-                                }
-                                else
-                                {
                                     AnimationCurve defaultCurve = AnimationCurve.Linear(0f, 0f, 1f, 1f);
                                     object createdKeyframe = null;
                                     var ctors = keyframeType.GetConstructors(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
-                                    // Try common ctors
                                     ConstructorInfo chosenCtor = ctors.FirstOrDefault(c =>
                                     {
                                         var ps = c.GetParameters();
@@ -758,11 +771,7 @@ namespace KK_StudioVoice
                                                 }
                                             }
                                         }
-                                        catch (Exception e)
-                                        {
-                                            SLog.Log.LogWarning($"[KK_StudioVoice] Keyframe を Activator.CreateInstance で作成中に例外: {e.Message}");
-                                            createdKeyframe = null;
-                                        }
+                                        catch{}
                                     }
                                     if (createdKeyframe != null)
                                     {
@@ -789,7 +798,6 @@ namespace KK_StudioVoice
                                                 {
                                                     var addMethod = kfDict.GetType().GetMethod("Add");
                                                     if (addMethod != null) addMethod.Invoke(kfDict, new object[] { time, createdKeyframe });
-                                                    else SLog.Log.LogWarning("[KK_StudioVoice] interpolable.keyframes に追加する方法が見つかりません。");
                                                 }
                                             }
                                             // duration を更新して表示されるようにする
@@ -811,18 +819,9 @@ namespace KK_StudioVoice
                                                     }
                                                 }
                                             }
-                                            catch { /* ignore */ }
-
+                                            catch {}
                                             added++;
                                         }
-                                        else
-                                        {
-                                            SLog.Log.LogWarning("[KK_StudioVoice] interpolable.keyframes が取得できませんでした（フォールバック失敗）。");
-                                        }
-                                    }
-                                    else
-                                    {
-                                        SLog.Log.LogWarning("[KK_StudioVoice] Keyframe を生成できませんでした（フォールバック失敗）。");
                                     }
                                 }
                             }
@@ -838,7 +837,6 @@ namespace KK_StudioVoice
                     }
                     else
                     {
-                        SLog.Log.LogWarning("[KK_StudioVoice] Timeline.AddKeyframe メソッドが見つかりません。");
                         break;
                     }
                     // --- ここまで差分チェック + 追加処理 ---
@@ -875,15 +873,9 @@ namespace KK_StudioVoice
                             var updateTarget = updateMethod.IsStatic ? null : timelineInstance;
                             updateMethod.Invoke(updateTarget, null);
                         }
-                        else
-                        {
-                        }
                     }
                 }
-                catch (Exception ex)
-                {
-                    SLog.Log.LogWarning($"[KK_StudioVoice] Timeline view update threw: {ex.Message}");
-                }
+                catch{}
                 // selected が OCIChar なら名前を取り出し、なければ "(unknown)" を使う
                 string targetName = (selected as OCIChar)?.charInfo?.name ?? "(unknown)";
             }
@@ -940,7 +932,7 @@ namespace KK_StudioVoice
                             }
                         }
                     }
-                    catch { /* 個別要素は無視 */ }
+                    catch {}
                 }
                 if (float.IsNegativeInfinity(bestTime)) return false;
                 foundKeyTime = bestTime;
@@ -986,7 +978,6 @@ namespace KK_StudioVoice
                 {
                     try { rm.Invoke(kfDict, new object[] { time }); return true; } catch { }
                 }
-
                 return false;
             }
             catch { return false; }

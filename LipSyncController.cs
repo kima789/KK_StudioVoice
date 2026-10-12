@@ -38,7 +38,7 @@ namespace KK_StudioVoice
                 DontDestroyOnLoad(gameObject);
 
                 // Harmonyパッチ適用
-                var harmony = new Harmony("com.yourname.kk_voice_lipsync");
+                var harmony = new Harmony("com.kk.studiovoice.lipsync");
                 harmony.PatchAll();
             }
             else
@@ -134,7 +134,6 @@ namespace KK_StudioVoice
 
                 yield return null;
             }
-
             // キャラ消滅時だけ完全クリーンアップ
             if (cha != null && cha.fbsCtrl?.MouthCtrl != null)
                 cha.fbsCtrl.MouthCtrl.SetFixedRate(-1f);

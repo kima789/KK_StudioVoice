@@ -8,53 +8,65 @@ using System.Linq;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
 using UnityEngine.SceneManagement;
 
 namespace KK_StudioVoice
 {
-    [BepInPlugin("KK_StudioVoice", "KK_StudioVoice", "1.2.0")]
+    [BepInPlugin("KK_StudioVoice", "KK_StudioVoice", "1.3.0")]
     [BepInProcess("CharaStudio")]
     public class MyVoicePlugin : BaseUnityPlugin
     {
         private int _lastObjectCount = -1;
-
         private Texture2D _toolbarIcon; // 1つのテクスチャを使い回す
         private byte[] _originalIconBytes; // 元の画像を保存しておく用
 
         // --- Config設定 ---
         private ConfigEntry<bool> _pluginEnabled;
         private ConfigEntry<KeyboardShortcut> _toggleKey;
-
         private ConfigEntry<bool> _defaultExcited;
         private ConfigEntry<bool> _defaultLipSync;
         private ConfigEntry<bool> _defaultVoice;
         private ConfigEntry<bool> _defaultBreath;
-
+        private ConfigEntry<float> _defaultVolume;
+        private ConfigEntry<bool> _optionHighlightEnabled;
         private ConfigEntry<float> _windowX;
         private ConfigEntry<float> _windowY;
 
         // 前回のフレームでの有効フラグの状態を保持する変数
         private bool _lastPluginEnabledState = true;
-
         private float _lastSaveTime = 0f;
 
         private bool _showPanel = false;
         private Rect windowRect;
         private bool _cameraDisabledByMe = false;
-
+        private Canvas _inputBlockCanvas;
+        private RectTransform _inputBlockRect;
+        private RawImage _inputBlockImage;
+        private bool _inputBlockCreated;
         public VoicePlayer _player;
         public VoiceDataLoader _dataLoader;
         private VoiceCacheManager _cacheManager;
-
         private HashSet<VoiceCharComponent> _refreshRequests = new HashSet<VoiceCharComponent>();
 
         private string _defaultMode = "";
         private string _defaultClip = "";
         private string _defaultOption = "None";
         public readonly string[] ExpList = { "First Time", "Amateur", "Pro", "Lewd" };
+        private string _volumeText = "";
+        private VoiceCharComponent _lastSelectedChar = null;
 
         // --- タイムラインと連動するプロパティ群 ---
         // これらは「代入された瞬間に変化をチェックし、変化があれば再生（RefreshVoice）を叩く」
+        public void RequestRefresh(VoiceCharComponent chara)
+        {
+            if (!_isInitialized) return;
+            if (!_refreshRequests.Contains(chara))
+            {
+                _refreshRequests.Add(chara);
+            }
+        }
         public string SelectedMode
         {
             get => GetActiveCharacterComponent()?.SelectedMode ?? _defaultMode;
@@ -150,14 +162,6 @@ namespace KK_StudioVoice
                 }
             }
         }
-        public void RequestRefresh(VoiceCharComponent chara)
-        {
-            if (!_isInitialized) return;
-            if (!_refreshRequests.Contains(chara))
-            {
-                _refreshRequests.Add(chara);
-            }
-        }
         public bool IsPlaying
         {
             get => GetActiveCharacterComponent()?.IsPlaying ?? false;
@@ -177,6 +181,26 @@ namespace KK_StudioVoice
                     if (value && _isInitialized)
                     {
                         RefreshVoice(chara);
+                    }
+                }
+            }
+        }
+        public float SelectedVolume
+        {
+            get => GetActiveCharacterComponent()?.Volume
+                ?? Mathf.Clamp01(_defaultVolume.Value / 100f);
+            set
+            {
+                var chara = GetActiveCharacterComponent();
+
+                if (chara != null && chara.SetVolume(value))
+                {
+                    var activeSource =
+                        chara.GetComponentInChildren<AudioSource>();
+
+                    if (activeSource != null)
+                    {
+                        activeSource.volume = value;
                     }
                 }
             }
@@ -203,8 +227,14 @@ namespace KK_StudioVoice
             _defaultLipSync = Config.Bind("Default", "LipSync", true, new ConfigDescription("LipSync の初期値", null, new ConfigurationManagerAttributes { Order = 3 }));
             _defaultVoice = Config.Bind("Default", "Voice", true, new ConfigDescription("Voice の初期値", null, new ConfigurationManagerAttributes { Order = 2 }));
             _defaultBreath = Config.Bind("Default", "Breath", true, new ConfigDescription("Breath の初期値", null, new ConfigurationManagerAttributes { Order = 1 }));
+            _defaultVolume = Config.Bind("Default","Volume",100f,new ConfigDescription("Volume の初期値（0～100%）",new AcceptableValueRange<float>(0f, 100f),new ConfigurationManagerAttributes { Order = 1 }));
 
-            // --- 3. UI Window 位置 (F1メニュー非表示設定) ---
+            _volumeText = Mathf.Round(_defaultVolume.Value).ToString();
+
+            // 3. Optionが選択可能な場合にハイライトするか
+            _optionHighlightEnabled = Config.Bind("UI", "Option Highlight Enabled", true, new ConfigDescription("Optionに選択肢がある際のハイライト表示を有効にする", null, new ConfigurationManagerAttributes { Order = 0 }));
+
+            // 4. UI Window 位置 (F1メニュー非表示設定) ---
             var hideInF1 = new ConfigDescription("UI Window Position", null, new ConfigurationManagerAttributes { Browsable = false });
 
             _windowX = Config.Bind("UI", "WindowPositionX", 300f, hideInF1);
@@ -212,6 +242,9 @@ namespace KK_StudioVoice
 
             // 保存されていた座標を適用（幅320、高さ50は既存のまま）
             windowRect = new Rect(_windowX.Value, _windowY.Value, 320f, 50f);
+
+            // Unity UI側のクリック貫通防止用
+            CreateInputBlocker();
 
             _dataLoader = new VoiceDataLoader();
             string dllPath = System.IO.Path.GetDirectoryName(Info.Location);
@@ -235,15 +268,17 @@ namespace KK_StudioVoice
                 _defaultMode = firstData.AnimeMode;
                 _defaultClip = firstData.AnimeClip;
             }
-            // 自動開閉処理をスタート
-            StartCoroutine(AutoOpenAndCloseWindow());
-
             SceneManager.sceneUnloaded += OnSceneUnloadedForVoice;
         }
         private void OnSceneUnloadedForVoice(Scene scene)
         {
             try
             {
+                if (_inputBlockRect != null)
+                {
+                    _inputBlockRect.gameObject.SetActive(false);
+                }
+                RestoreCameraForInputBlocker();
                 // プレイヤーが MonoBehaviour ならコルーチンを止める
                 if (_player != null)
                 {
@@ -255,22 +290,6 @@ namespace KK_StudioVoice
             {
                 SLog.Log.LogWarning($"[KK_StudioVoice] OnSceneUnloadedForVoice error: {e}");
             }
-        }
-        private IEnumerator AutoOpenAndCloseWindow()
-        {
-            // スタジオが起動し、画面が落ち着くまで少し待つ（1.5秒）
-            yield return new WaitForSeconds(1.5f);
-
-            // ウィンドウを一瞬だけ開く
-            _showPanel = true;
-            UpdateToolbarIcon();
-
-            // 1フレーム待つ（これにより OnGUI が1回以上走り、レイアウトが確定する）
-            yield return null;
-
-            // ウィンドウを閉じる
-            _showPanel = false;
-            UpdateToolbarIcon();
         }
         private void Update()
         {
@@ -389,67 +408,78 @@ namespace KK_StudioVoice
                         int currentPersonality =
                                 ociChar.charInfo.chaFile.parameter.personality;
 
-                            // 初回
-                            if (charaComp.LastPersonality == 0)
+                        // 初回
+                        if (charaComp.LastPersonality == 0)
+                        {
+                            charaComp.LastPersonality = currentPersonality;
+                        }
+                        // 置換検知
+                        else if (charaComp.LastPersonality != currentPersonality)
+                        {
+                            charaComp.LastPersonality = currentPersonality;
+
+                            bool shouldResume = charaComp.IsPlaying;
+
+                            charaComp.ReservedNextAction = null;
+
+                            _player.StopVoice(charaComp, false);
+
+                            charaComp.IsVoicePlaying = false;
+                            charaComp.IsCurrentNotLoop = false;
+                            charaComp.ReservedNextAction = null;
+
+                            StartCoroutine(RefreshVoiceDelayed(charaComp, shouldResume));
+                        }
+                        // スタジオ上の現在の表示フラグを取得
+                        bool currentVisible = true;
+                        TreeNodeObject node = ociChar.treeNodeObject;
+
+                        // 親ノードを辿って、1つでも非表示（visible == false）があれば false にする
+                        while (node != null)
+                        {
+                            if (!node.visible)
                             {
-                                charaComp.LastPersonality = currentPersonality;
+                                currentVisible = false;
+                                break;
                             }
-                            // 置換検知
-                            else if (charaComp.LastPersonality != currentPersonality)
+                            node = node.parent;
+                        }
+                        // 判定結果を使って処理
+                        if (currentVisible != charaComp.LastVisible)
+                        {
+                            charaComp.LastVisible = currentVisible;
+                            if (currentVisible)
                             {
-                                charaComp.LastPersonality = currentPersonality;
-
-                                bool shouldResume = charaComp.IsPlaying;
-
-                                charaComp.ReservedNextAction = null;
-
-                                _player.StopVoice(charaComp, false);
-
-                                charaComp.IsVoicePlaying = false;
-                                charaComp.IsCurrentNotLoop = false;
-                                charaComp.ReservedNextAction = null;
-
-                                StartCoroutine(RefreshVoiceDelayed(charaComp, shouldResume));
+                                if (charaComp.IsPlaying)
+                                {
+                                    _player.StopVoice(charaComp);
+                                    RefreshVoice(charaComp);
+                                }
                             }
-                            // スタジオ上の現在の表示フラグを取得
-                            bool currentVisible = true;
-                            TreeNodeObject node = ociChar.treeNodeObject;
-
-                            // 親ノードを辿って、1つでも非表示（visible == false）があれば false にする
-                            while (node != null)
+                            else
                             {
-                                if (!node.visible)
-                                {
-                                    currentVisible = false;
-                                    break;
-                                }
-                                node = node.parent;
-                            }
-                            // 判定結果を使って処理
-                            if (currentVisible != charaComp.LastVisible)
-                            {
-                                charaComp.LastVisible = currentVisible;
-                                if (currentVisible)
-                                {
-                                    if (charaComp.IsPlaying)
-                                    {
-                                        _player.StopVoice(charaComp);
-                                        RefreshVoice(charaComp);
-                                    }
-                                }
-                                else
-                                {
-                                    _player.StopVoice(charaComp, true);
-                                }
+                                _player.StopVoice(charaComp, true);
                             }
                         }
                     }
                 }
             }
+        }
         private void OnDestroy()
         {
             try { SceneManager.sceneUnloaded -= OnSceneUnloadedForVoice; } catch { }
             try { _timelineCompat?.Dispose(); } catch { }
+
+            RestoreCameraForInputBlocker();
+
+            if (_inputBlockCanvas != null)
+            {
+                Destroy(_inputBlockCanvas.gameObject);
+                _inputBlockCanvas = null;
+            }
+            _inputBlockRect = null;
+            _inputBlockImage = null;
+            _inputBlockCreated = false;
         }
         private VoiceCharComponent AttachVoiceCharComponentSafely(GameObject go)
         {
@@ -467,7 +497,6 @@ namespace KK_StudioVoice
             {
                 return null;
             }
-
             // 既に付いていればそれを返す
             var comp = go.GetComponent<VoiceCharComponent>();
             if (comp != null) return comp;
@@ -484,6 +513,7 @@ namespace KK_StudioVoice
                 comp.SetLipSyncOn(_defaultLipSync.Value);
                 comp.SetVoiceOn(_defaultVoice.Value);
                 comp.SetBreathOn(_defaultBreath.Value);
+                comp.SetVolume(Mathf.Clamp01(_defaultVolume.Value / 100f));
                 return comp;
             }
             catch (Exception e)
@@ -523,7 +553,6 @@ namespace KK_StudioVoice
                 SLog.Log.LogWarning($"[Voice] ロードタイムアウト: personality={pId}");
                 yield break;
             }
-
             if (!charaComp.gameObject.activeInHierarchy)
                 yield break;
 
@@ -550,7 +579,7 @@ namespace KK_StudioVoice
             }
             _lastObjectCount = currentCount;
         }
-        //　アイコンの生成
+        // アイコンの生成
         private IEnumerator AddButtonSafe()
         {
             yield return new WaitForSeconds(1.0f);
@@ -558,21 +587,27 @@ namespace KK_StudioVoice
             _toolbarIcon = new Texture2D(32, 32);
             try
             {
-                string dllPath = System.IO.Path.GetDirectoryName(Info.Location);
-                string iconPath = System.IO.Path.Combine(dllPath, "KK_StudioVoice.png");
+                // 埋め込みリソースからストリームとして取得
+                var assembly = System.Reflection.Assembly.GetExecutingAssembly();
+                string resourceName = "KK_StudioVoice.KK_StudioVoice.png";
 
-                if (System.IO.File.Exists(iconPath))
+                using (var stream = assembly.GetManifestResourceStream(resourceName))
                 {
-                    _originalIconBytes = System.IO.File.ReadAllBytes(iconPath);
-                    _toolbarIcon.LoadImage(_originalIconBytes);
-                }
-                else
-                {
-                    // 代替画像
-                    for (int x = 0; x < 32; x++)
-                        for (int y = 0; y < 32; y++)
-                            _toolbarIcon.SetPixel(x, y, Color.gray);
-                    _toolbarIcon.Apply();
+                    if (stream != null)
+                    {
+                        _originalIconBytes = new byte[stream.Length];
+                        stream.Read(_originalIconBytes, 0, _originalIconBytes.Length);
+                        _toolbarIcon.LoadImage(_originalIconBytes);
+                    }
+                    else
+                    {
+                        // 代替画像
+                        for (int x = 0; x < 32; x++)
+                            for (int y = 0; y < 32; y++)
+                                _toolbarIcon.SetPixel(x, y, Color.gray);
+                        _toolbarIcon.Apply();
+                        SLog.Log.LogWarning($"[KK_StudioVoice] アイコンのリソースが見つかりませんでした: {resourceName}");
+                    }
                 }
                 // ボタン作成
                 var myButton = new SimpleToolbarButton(
@@ -582,6 +617,22 @@ namespace KK_StudioVoice
                     this,
                     _ => {
                         _showPanel = !_showPanel;
+
+                        if (_showPanel)
+                        {
+                            _volumeText = Mathf.Round(
+                                SelectedVolume * 100f
+                            ).ToString();
+                        }
+                        else
+                        {
+                            if (_inputBlockRect != null)
+                            {
+                                _inputBlockRect.gameObject.SetActive(false);
+                            }
+
+                            RestoreCameraForInputBlocker();
+                        }
                         UpdateToolbarIcon(); // クリック時に中身を書き換える
                     }
                 );
@@ -620,7 +671,7 @@ namespace KK_StudioVoice
             _toolbarIcon.Apply();
         }
         /// 現在選択されているキャラクターから VoiceCharComponent を取得します。
-        /// /// コンポーネントが存在しない場合は、その場で新しく追加します。
+        /// コンポーネントが存在しない場合は、その場で新しく追加します。
         public VoiceCharComponent GetActiveCharacterComponent()
         {
             var ociChar = KKAPI.Studio.StudioAPI.GetSelectedCharacters().FirstOrDefault();
@@ -680,44 +731,205 @@ namespace KK_StudioVoice
                 chara.SelectedClip,
                 chara.SelectedOption,
                 chara.IsExcited,
-                expValue,_dataLoader,
+                expValue, _dataLoader,
                 chara.IsVoiceOn,
                 chara.IsBreathOn
             );
+        }
+        public void SelectedVolumeSyncFromTimeline(VoiceCharComponent chara, float volume01)
+        {
+            if (chara != null)
+            {
+                chara.SetVolume(volume01);
+            }
+
+            // パネルが表示中で、かつ「今タイムラインで変更されたキャラ」が「現在UIで選択中のキャラ」と一致する場合のみテキストを同期
+            if (_showPanel && chara == GetActiveCharacterComponent())
+            {
+                _volumeText = Mathf.Round(volume01 * 100f).ToString();
+            }
+        }
+        // UnityUIへの貫通防止用の透明UIの作成
+        private void CreateInputBlocker()
+        {
+            if (_inputBlockCreated)
+                return;
+
+            GameObject canvasObject = new GameObject(
+                "KK_StudioVoice_InputBlockCanvas",
+                typeof(Canvas),
+                typeof(CanvasScaler),
+                typeof(GraphicRaycaster)
+            );
+            canvasObject.hideFlags = HideFlags.HideAndDontSave;
+
+            _inputBlockCanvas =
+                canvasObject.GetComponent<Canvas>();
+
+            _inputBlockCanvas.renderMode =
+                RenderMode.ScreenSpaceOverlay;
+
+            _inputBlockCanvas.pixelPerfect = true;
+            _inputBlockCanvas.sortingOrder = 999;
+
+            CanvasScaler scaler =
+                canvasObject.GetComponent<CanvasScaler>();
+
+            scaler.uiScaleMode =
+                CanvasScaler.ScaleMode.ConstantPixelSize;
+
+            scaler.scaleFactor = 1f;
+            scaler.referencePixelsPerUnit = 100f;
+
+            GraphicRaycaster raycaster =
+                canvasObject.GetComponent<GraphicRaycaster>();
+
+            raycaster.ignoreReversedGraphics = true;
+            raycaster.blockingObjects =
+                GraphicRaycaster.BlockingObjects.None;
+
+            DontDestroyOnLoad(canvasObject);
+
+            // 透明なRaycastブロッカーを作成
+            GameObject imageObject = new GameObject(
+                "KK_StudioVoice_InputBlockImage",
+                typeof(RectTransform),
+                typeof(CanvasRenderer),
+                typeof(RawImage)
+            );
+            imageObject.transform.SetParent(
+                _inputBlockCanvas.transform,
+                false
+            );
+            _inputBlockRect =
+                imageObject.GetComponent<RectTransform>();
+
+            _inputBlockImage =
+                imageObject.GetComponent<RawImage>();
+
+            // 完全透明だが、Unity UIのRaycastは受け取る
+            _inputBlockImage.color =
+                new Color(0f, 0f, 0f, 0f);
+
+            _inputBlockImage.raycastTarget = true;
+
+            imageObject.AddComponent<DisableCameraControlOnClick>();
+
+            imageObject.SetActive(false);
+
+            _inputBlockCreated = true;
+        }
+        // 透明UIをOnGUIのウィンドウ位置に合わせて移動・サイズ変更する
+        private void UpdateInputBlockerRect()
+        {
+            if (!_inputBlockCreated ||
+                _inputBlockCanvas == null ||
+                _inputBlockRect == null)
+            {
+                return;
+            }
+            if (!_showPanel)
+            {
+                if (_inputBlockRect.gameObject.activeSelf)
+                {
+                    _inputBlockRect.gameObject.SetActive(false);
+                }
+                return;
+            }
+            if (!_inputBlockRect.gameObject.activeSelf)
+            {
+                _inputBlockRect.gameObject.SetActive(true);
+            }
+            _inputBlockRect.anchorMin =
+                new Vector2(0.5f, 0.5f);
+
+            _inputBlockRect.anchorMax =
+                new Vector2(0.5f, 0.5f);
+
+            _inputBlockRect.pivot =
+                new Vector2(0.5f, 0.5f);
+
+            _inputBlockRect.anchoredPosition =
+                new Vector2(
+                    windowRect.center.x - Screen.width * 0.5f,
+                    Screen.height * 0.5f - windowRect.center.y
+                );
+            _inputBlockRect.sizeDelta =
+                new Vector2(
+                    windowRect.width,
+                    windowRect.height
+                );
+        }
+        private void DisableCameraForInputBlocker()
+        {
+            if (_cameraDisabledByMe)
+                return;
+
+            var cameraCtrl =
+                Studio.Studio.Instance != null
+                    ? Studio.Studio.Instance.cameraCtrl
+                    : null;
+
+            if (cameraCtrl != null && cameraCtrl.enabled)
+            {
+                cameraCtrl.enabled = false;
+                _cameraDisabledByMe = true;
+            }
+        }
+        private void RestoreCameraForInputBlocker()
+        {
+            if (!_cameraDisabledByMe)
+                return;
+
+            var cameraCtrl =
+                Studio.Studio.Instance != null
+                    ? Studio.Studio.Instance.cameraCtrl
+                    : null;
+
+            if (cameraCtrl != null)
+                cameraCtrl.enabled = true;
+
+            _cameraDisabledByMe = false;
         }
         private void OnGUI()
         {
             if (!_showPanel)
             {
-                if (_cameraDisabledByMe) RestoreState();
+                if (_cameraDisabledByMe) RestoreCameraForInputBlocker();
                 return;
             }
             Vector2 mousePos = new Vector2(Input.mousePosition.x, Screen.height - Input.mousePosition.y);
             bool isMouseInWindow = windowRect.Contains(mousePos);
 
+            // UI外クリック時に、空文字や入力途中の文字列を再表示
+            if (Event.current.type == EventType.MouseDown &&
+                Event.current.button == 0 &&
+                !isMouseInWindow)
+            {
+                _volumeText = Mathf.Round(SelectedVolume * 100f).ToString();
+            }
+
             if (isMouseInWindow || GUIUtility.hotControl != 0)
             {
-                // 1. カメラ制御の停止（マウスでのカメラ回転・移動を防ぐ）
-                var cameraCtrl = Studio.Studio.Instance != null ? Studio.Studio.Instance.cameraCtrl : null;
-                if (cameraCtrl != null && cameraCtrl.enabled)
-                {
-                    cameraCtrl.enabled = false;
-                    _cameraDisabledByMe = true;
-                }
-                // 2. スタジオUI（Canvas）への貫通防止
+                DisableCameraForInputBlocker();
+                // IMGUIへの貫通防止
                 if (UnityEngine.EventSystems.EventSystem.current != null)
                 {
-                    UnityEngine.EventSystems.EventSystem.current.SetSelectedGameObject(null);
+                    UnityEngine.EventSystems.EventSystem.current
+                        .SetSelectedGameObject(null);
                 }
             }
             else if (_cameraDisabledByMe)
             {
-                RestoreState();
+                RestoreCameraForInputBlocker();
             }
             // --- ウィンドウ描画 ---
             Rect oldRect = windowRect; // ドラッグ前の座標を覚えておく
 
             windowRect = GUI.Window(123456, windowRect, DrawVoicePanel, "KK_StudioVoice");
+
+            // IMGUIウィンドウの位置・サイズを透明UGUIへ同期
+            UpdateInputBlockerRect();
 
             // 座標が変わっていて、かつ前回の保存から0.5秒以上経っている場合だけ保存
             if (windowRect.x != oldRect.x || windowRect.y != oldRect.y)
@@ -740,14 +952,15 @@ namespace KK_StudioVoice
                 }
             }
         }
-        private void RestoreState()
-        {
-            var cameraCtrl = Studio.Studio.Instance != null ? Studio.Studio.Instance.cameraCtrl : null;
-            if (cameraCtrl != null) cameraCtrl.enabled = true;
-            _cameraDisabledByMe = false;
-        }
         private void DrawVoicePanel(int windowID)
         {
+            // 選択キャラクターが切り替わったかどうかのチェック ---
+            var currentChar = GetActiveCharacterComponent();
+            if (currentChar != _lastSelectedChar)
+            {
+                _lastSelectedChar = currentChar;
+                _volumeText = Mathf.Round(SelectedVolume * 100f).ToString();
+            }
             // マウス操作が行われた際、このウィンドウにフォーカスを当ててイベントを消費させる
             if (Event.current.type == EventType.MouseDown)
             {
@@ -792,7 +1005,6 @@ namespace KK_StudioVoice
                 }
                 GUI.EndScrollView(); currentY += listH + space;
             }
-
             // --- 2. Anime Clip ---
             GUI.Label(new Rect(x, currentY, w, itemH), "【Anime Clip】");
             currentY += itemH;
@@ -829,11 +1041,25 @@ namespace KK_StudioVoice
                 }
                 GUI.EndScrollView(); currentY += listH + space;
             }
-
             // --- 3. Option ---
             GUI.Label(new Rect(x, currentY, w, itemH), "【Option】");
             currentY += itemH;
 
+            // 現在のModeとClipにおいて、"None" 以外の有効なオプションが存在するか判定する
+            bool hasAvailableOptions = false;
+            if (!string.IsNullOrEmpty(SelectedClip))
+            {
+                hasAvailableOptions = _dataLoader.VoiceDataList
+                    .Where(d => d.AnimeMode == SelectedMode && d.AnimeClip == SelectedClip)
+                    .Select(d => NormalizeOption(d.Option))
+                    .Any(opt => opt != "None");
+            }
+            Color originalBgColor = GUI.backgroundColor;
+            // 設定が有効かつオプションが存在する場合にハイライト表示
+            if (_optionHighlightEnabled.Value && hasAvailableOptions)
+            {
+                GUI.color = Color.yellow;
+            }
             if (GUI.Button(new Rect(x, currentY, w, itemH),
                 string.IsNullOrEmpty(SelectedClip) ? "(Select Clip First)" : SelectedOption))
             {
@@ -841,8 +1067,9 @@ namespace KK_StudioVoice
                 showModeList = false;
                 showClipList = false;
             }
+            // 色をもとに戻す
+            GUI.color = Color.white;
             currentY += itemH + space;
-
             if (showOptionList)
             {
                 var query = _dataLoader.VoiceDataList
@@ -897,18 +1124,69 @@ namespace KK_StudioVoice
             IsBreathOn = GUI.Toggle(new Rect(x + tw + space, currentY, tw, itemH), IsBreathOn, " Breath");
             currentY += itemH + space;
 
-            // --- 5. 再生ボタン ---
+            // --- 5. 音量調整 (0% 〜 100%) ---
+            GUI.Label(new Rect(x, currentY, w - 55f, itemH), "【Volume】");
+            Rect volumeTextRect = new Rect(x + w - 50f, currentY, 50f, itemH);
+
+            // SelectedVolumeから毎フレーム作り直さず、
+            // 前回の入力文字列をそのままTextFieldへ渡す。
+            // そのため、空文字も次のフレームまで保持される。
+            _volumeText = GUI.TextField(volumeTextRect, _volumeText);
+            GUI.Label(new Rect(x + w - 22f, currentY, 25f, itemH), "%");
+
+            // 空文字の場合はSelectedVolumeを変更しない。
+            // したがって、直前の有効な音量値が保持される。
+            if (!string.IsNullOrEmpty(_volumeText) &&
+                float.TryParse(_volumeText, out float parsedPercent))
+            {
+                parsedPercent = Mathf.Clamp(parsedPercent, 0f, 100f);
+                SelectedVolume = parsedPercent / 100f;
+            }
+            currentY += itemH;
+
+            // 2行目：スライダー
+            float currentVol = SelectedVolume;
+
+            // スライダーを描画する矩形を Rect として定義しておく
+            Rect sliderRect = new Rect(x, currentY, w, itemH);
+            float newVol = GUI.HorizontalSlider(sliderRect, currentVol, 0f, 1f);
+
+            // マウスホイールによる音量変更処理
+            if (Event.current.type == EventType.ScrollWheel && sliderRect.Contains(Event.current.mousePosition))
+            {
+                // ホイールの上下に応じて増減量を決定（1スクロールで ±1% = ±0.01）
+                float scrollDelta = -Mathf.Sign(Event.current.delta.y) * 0.01f;
+                newVol = Mathf.Clamp01(currentVol + scrollDelta);
+
+                // イベントを消費して、他のウィンドウ等へのスクロール伝播を防ぐ
+                Event.current.Use();
+            }
+            if (!Mathf.Approximately(newVol, currentVol))
+            {
+                SelectedVolume = newVol;
+
+                // スライダー操作時はテキストも有効値へ同期する
+                if (GetActiveCharacterComponent() != null)
+                {
+                    SelectedVolume = newVol;
+                    _volumeText = Mathf.Round(newVol * 100f).ToString();
+                }
+            }
+            currentY += itemH + space;
+
+            // --- 6. 再生ボタン ---
             GUI.backgroundColor = IsPlaying ? new Color(1.0f, 0.3f, 0.3f) : Color.white;
             string btnText = IsPlaying ? "STOP ■" : "PLAY ▶";
 
             if (GUI.Button(new Rect(x, currentY, w, 40f), btnText))
-            {// プロパティを反転させるだけで、中の setter が動き 
+            {
+                // プロパティを反転させるだけで、中の setter が動き 
                 // RefreshVoice(chara) もしくは StopVoice(chara) が自動で呼ばれる
                 IsPlaying = !IsPlaying;
             }
             currentY += 45f;
 
-            // --- 6. タイムラインへのキーフレーム追加ボタン ---
+            // --- 7. タイムラインへのキーフレーム追加ボタン ---
             GUI.backgroundColor = Color.white;
             if (GUI.Button(new Rect(x, currentY, w, 25f), "Add Timeline Keys"))
             {
@@ -916,13 +1194,68 @@ namespace KK_StudioVoice
             }
             currentY += 30f;
 
-            // --- 7. 閉じるボタン ---
+            // --- 8. 閉じるボタン ---
             if (GUI.Button(new Rect(x, currentY, w, 25f), "Close"))
             {
                 _showPanel = false;
-                UpdateToolbarIcon(); // ここでも呼び出して色を戻す
+
+                if (_inputBlockRect != null)
+                {
+                    _inputBlockRect.gameObject.SetActive(false);
+                }
+                RestoreCameraForInputBlocker();
+                UpdateToolbarIcon();
             }
             windowRect.height = currentY + 30f;
+        }
+        private class DisableCameraControlOnClick :
+            UIBehaviour,
+            IPointerDownHandler,
+            IPointerUpHandler,
+            IEndDragHandler
+        {
+            public void OnPointerDown(PointerEventData eventData)
+            {
+                MyVoicePlugin owner =
+                    FindObjectOfType<MyVoicePlugin>();
+
+                if (owner != null)
+                {
+                    owner.DisableCameraForInputBlocker();
+                }
+            }
+            public void OnPointerUp(PointerEventData eventData)
+            {
+                MyVoicePlugin owner =
+                    FindObjectOfType<MyVoicePlugin>();
+
+                if (owner != null)
+                {
+                    owner.RestoreCameraForInputBlocker();
+                }
+            }
+            public void OnEndDrag(PointerEventData eventData)
+            {
+                MyVoicePlugin owner =
+                    FindObjectOfType<MyVoicePlugin>();
+
+                if (owner != null)
+                {
+                    owner.RestoreCameraForInputBlocker();
+                }
+            }
+            protected override void OnDisable()
+            {
+                base.OnDisable();
+
+                MyVoicePlugin owner =
+                    FindObjectOfType<MyVoicePlugin>();
+
+                if (owner != null)
+                {
+                    owner.RestoreCameraForInputBlocker();
+                }
+            }
         }
     }
 }
